@@ -1,0 +1,121 @@
+trigger: none
+
+stages:
+  - stage: DeployInfra
+    jobs:
+      - job: TerraformApply
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: '1.3.0'
+
+          - task: TerraformTaskV4@4
+            name: tfInit
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: 'infra'
+              backendServiceArm: 'AzureServiceConnection'
+              backendAzureRmResourceGroupName: 'blogapp-rg'
+              backendAzureRmStorageAccountName: 'tfstateblogapp'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'terraform.tfstate'
+
+          - task: TerraformTaskV4@4
+            name: tfPlan
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: 'infra'
+              environmentServiceNameAzureRM: 'AzureServiceConnection'
+
+          - task: TerraformTaskV4@4
+            name: tfApply
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: 'infra'
+              environmentServiceNameAzureRM: 'AzureServiceConnection'
+              args: '-auto-approve'
+
+  - stage: DeployAppService
+    dependsOn: DeployInfra
+    jobs:
+      - job: AppServiceDeploy
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'drop'
+              downloadPath: '$(System.ArtifactsDirectory)'
+
+          - task: AzureWebApp@1
+            inputs:
+              azureSubscription: 'AzureServiceConnection'
+              appName: 'blog-webapp'
+              package: '$(System.ArtifactsDirectory)/drop'
+
+          - task: AzureCLI@2
+            displayName: 'Rollback App Service on Failure'
+            condition: failed()
+            inputs:
+              azureSubscription: 'AzureServiceConnection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "App Service Deployment failed. Rolling back..."
+                az webapp deployment slot swap --name blog-webapp --resource-group blogapp-rg --slot staging --target-slot production
+
+  - stage: DeployAKS
+    dependsOn: DeployInfra
+    jobs:
+      - job: DeployToAKS
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+
+          - task: Kubernetes@1
+            displayName: 'Deploy to AKS'
+            inputs:
+              connectionType: 'Azure Resource Manager'
+              azureSubscription: 'AzureServiceConnection'
+              azureResourceGroup: 'blogapp-rg'
+              kubernetesCluster: 'blog-aks-cluster'
+              namespace: 'default'
+              command: 'apply'
+              useConfigurationFile: true
+              configuration: 'infra/manifests/deployment.yaml'
+
+  - stage: DeployACI
+    dependsOn: DeployInfra
+    jobs:
+      - job: DeployToACI
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Deploy to ACI'
+            inputs:
+              azureSubscription: 'AzureServiceConnection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az container create \
+                  --resource-group blogapp-rg \
+                  --name blog-batch-jobs \
+                  --image mcr.microsoft.com/azuredocs/aci-helloworld \
+                  --cpu 1 \
+                  --memory 1.5 \
+                  --dns-name-label blogbatchjobdemo \
+                  --ports 80
